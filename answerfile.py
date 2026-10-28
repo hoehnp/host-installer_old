@@ -177,7 +177,12 @@ class Answerfile:
         results['install-type'] = INSTALL_TYPE_REINSTALL
         results['preserve-settings'] = True
         results['backup-existing-installation'] = True
-        results.update(self.parseExistingInstallation())
+
+        partition_devices = self.parsePartitionDevices()
+        if partition_devices:
+            results.update(partition_devices)
+        else:
+            results.update(self.parseExistingInstallation())
 
         # FIXME - obsolete?
         nodes = getElementsByTagName(self.top_node, ['primary-disk'])
@@ -267,7 +272,56 @@ class Answerfile:
             xelogging.log("Warning: selecting 1st path from %s" % str(map(lambda x: x.primary_disk, installations)))
         results['installation-to-overwrite'] = installations[0]
         return results
-    
+
+    def parsePartitionDevices(self):
+        results = {}
+
+        nodes = getElementsByTagName(self.top_node, ['partition-devices'])
+        if len(nodes) == 0:
+            return results
+
+        node = nodes[0]
+        root_dev = getStrAttribute(node, ['root'])
+        state_dev = getStrAttribute(node, ['state'])
+        boot_dev = getStrAttribute(node, ['boot'])
+        logs_dev = getStrAttribute(node, ['logs'])
+        storage_dev = getStrAttribute(node, ['storage'])
+
+        if root_dev:
+            root_dev = normalize_disk(root_dev)
+            results['partition-root'] = root_dev
+
+        if state_dev:
+            state_dev = normalize_disk(state_dev)
+            results['partition-state'] = state_dev
+
+        if boot_dev:
+            boot_dev = normalize_disk(boot_dev)
+            results['partition-boot'] = boot_dev
+
+        if logs_dev:
+            logs_dev = normalize_disk(logs_dev)
+            results['partition-logs'] = logs_dev
+
+        if storage_dev:
+            storage_dev = normalize_disk(storage_dev)
+            results['partition-storage'] = storage_dev
+
+        if root_dev:
+            storage = None
+            if storage_dev:
+                storage = (diskutil.STORAGE_LVM, storage_dev)
+
+            inst = product.ExistingRetailInstallation(
+                root_dev.split('p')[0] if 'p' in root_dev else root_dev,
+                boot_dev, root_dev, state_dev or root_dev, storage)
+            results['installation-to-overwrite'] = inst
+            results['install-type'] = INSTALL_TYPE_REINSTALL
+            results['primary-disk'] = inst.primary_disk
+            results['preserve-settings'] = inst.settingsAvailable()
+
+        return results
+
     def parseSource(self):
         results = {'sources': []}
         sources = getElementsByTagName(self.top_node, ['source'], mandatory = True)

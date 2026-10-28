@@ -46,6 +46,8 @@ def runMainSequence(results, ram_warning, vt_warning, suppress_extra_cd_dialog):
     Step = uicontroller.Step
 
     def only_unupgradeable_products(answers):
+        if answers.get('detection-overridden', False):
+            return False
         return len(answers['installed-products']) > 0 and \
                len(answers['upgradeable-products']) == 0 and \
                len(answers['backups']) == 0
@@ -127,6 +129,9 @@ def runMainSequence(results, ram_warning, vt_warning, suppress_extra_cd_dialog):
     seq = [
         Step(uis.welcome_screen),
         Step(uis.eula_screen),
+        Step(uis.override_installation_detection,
+             predicates=[lambda _: not results.get('detection-overridden', False) and
+                         (len(results['installed-products']) > 0 or len(results['backups']) > 0)]),
         Step(uis.hardware_warnings,
              args=[ram_warning, vt_warning],
              predicates=[lambda _:(ram_warning or vt_warning)]),
@@ -155,7 +160,7 @@ def runMainSequence(results, ram_warning, vt_warning, suppress_extra_cd_dialog):
         Step(tui.repo.select_repo_source,
              args=["Select Installation Source", "Please select the type of source you would like to use for this installation"],
              predicates=[is_not_restore_fn]),
-        Step(uis.setup_runtime_networking, 
+        Step(uis.setup_runtime_networking,
              predicates=[need_networking]),
         Step(uis.master_not_upgraded,
              predicates=[out_of_order_pool_upgrade_fn]),
