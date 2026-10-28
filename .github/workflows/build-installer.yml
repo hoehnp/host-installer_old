@@ -1,0 +1,50 @@
+name: Build Installer
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      xcp_ng_version:
+        description: 'XCP-ng version (e.g., 8.3)'
+        required: false
+        default: '8.3'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Verify Python syntax
+        run: |
+          python -m py_compile *.py
+          python -m py_compile tui/*.py
+          python -m py_compile tui/installer/*.py
+
+      - name: Run tests
+        run: |
+          if [ -f test/test.sh ]; then
+            chmod +x test/test.sh
+            ./test/test.sh
+          fi
+
+      - name: Build installer package
+        run: |
+          make install DESTDIR=${{ github.workspace }}/build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-installer-build
+          path: build/
+          retention-days: 7
