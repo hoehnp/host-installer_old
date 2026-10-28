@@ -1,0 +1,74 @@
+name: Build Modified ISO
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-iso:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: '7.6'
+            iso_url: 'https://mirrors.xcp-ng.org/isos/7.6/xcp-ng-7.6.0.iso'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y genisoimage cpio bzip2
+
+      - name: Download base ISO
+        run: |
+          echo "Downloading from: ${{ matrix.iso_url }}"
+          wget -q "${{ matrix.iso_url }}" -O base-xcpng.iso
+
+      - name: Extract ISO
+        run: |
+          mkdir -p tmpmountdir iso
+          sudo mount -o loop base-xcpng.iso tmpmountdir
+          cp -a tmpmountdir/. iso/
+          sudo umount tmpmountdir
+          chmod a+w iso/ -R
+
+      - name: Extract install.img
+        run: |
+          cd iso
+          mkdir -p installcd install
+          cd install
+          bunzip2 < ../install.img | cpio -idm
+          cd ..
+
+      - name: Build and install host-installer
+        run: |
+          make install DESTDIR=${{ github.workspace }}/iso/install/opt/xensource/installer
+
+      - name: Rebuild install.img
+        run: |
+          cd iso/install
+          find . | cpio -o -H newc | bzip2 > ../install.img
+          cd ..
+          rm -rf install/
+
+      - name: Build new ISO
+        run: |
+          OUTPUT=xcpng-${{ matrix.version }}-modified.iso
+          VERSION=${{ matrix.version }}
+          cd iso
+          genisoimage -o ../$OUTPUT -v -r -J --joliet-long \
+            -V "XCP-ng $VERSION" \
+            -c boot/isolinux/boot.cat \
+            -b boot/isolinux/isolinux.bin \
+            -no-emul-boot -boot-load-size 4 -boot-info-table \
+            -eltorito-alt-boot -e boot/efiboot.img -no-emul-boot .
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcpng-${{ matrix.version }}-modified-iso
+          path: xcpng-*-modified.iso
+          retention-days: 30

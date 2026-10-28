@@ -1,0 +1,245 @@
+name: Build modified XCP-ng ISOs (host-installer integration)
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  INSTALLER_REPO: hoehnp/host-installer
+  INSTALLER_BRANCH: test_ai_code
+
+jobs:
+  modified-iso:
+    name: XCP-ng ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: "7.6"
+            iso_url: "https://updates.xcp-ng.org/isos/7.6/xcp-ng-7.6.0.iso"
+
+    env:
+      WS: ${{ github.workspace }}
+      ISO_FILE: ${{ github.workspace }}/download/original.iso
+      ISO_DIR: ${{ github.workspace }}/iso
+      OUT_DIR: ${{ github.workspace }}/out
+
+    steps:
+      - name: Prepare names
+        run: |
+          set -euo pipefail
+          BRANCH_SAFE="$(printf '%s' "$INSTALLER_BRANCH" | sed -e 's#[^A-Za-z0-9._-]#-#g')"
+          echo "BRANCH_SAFE=$BRANCH_SAFE" >> "$GITHUB_ENV"
+          echo "OUT_ISO=$OUT_DIR/xcp-ng-${{ matrix.version }}-installer-${BRANCH_SAFE}.iso" >> "$GITHUB_ENV"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            genisoimage xorriso isomd5sum squashfs-tools e2fsprogs \
+            rsync file isolinux wget cpio fakeroot
+
+      - name: Check out host-installer (${{ env.INSTALLER_BRANCH }})
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.INSTALLER_REPO }}
+          ref: ${{ env.INSTALLER_BRANCH }}
+          path: host-installer
+
+      # The installer is a python program; per the docs its files live mostly
+      # in /opt/xensource/installer/. Stage them from the test_ai_code branch
+      # so they can be overlaid directly into install.img.
+      - name: Stage installer files from test_ai_code
+        run: |
+          set -euo pipefail
+          STAGE="$WS/stage"
+          mkdir -p "$STAGE/opt/xensource/installer" "$STAGE/usr/bin"
+
+          cd "$WS/host-installer"
+          rsync -a \
+            --exclude '.git/' --exclude '.github/' --exclude '.hgignore' \
+            --exclude 'test/' --exclude 'doc/' --exclude 'Makefile' \
+            ./ "$STAGE/opt/xensource/installer/"
+          install -m755 support.sh "$STAGE/usr/bin/support.sh" || true
+
+          echo "Staged installer files:"
+          find "$STAGE" -maxdepth 3 | sed -n '1,30p'
+
+      - name: Download official XCP-ng ${{ matrix.version }} ISO
+        run: |
+          set -euo pipefail
+          mkdir -p "$WS/download"
+          wget -q -O "$ISO_FILE" "${{ matrix.iso_url }}"
+          ls -lh "$ISO_FILE"
+
+      # --- docs step: extract the ISO (mount -o loop ... ; cp -a ...) ---
+      - name: Extract ISO contents
+        run: |
+          set -euo pipefail
+          MNT="$WS/mnt"
+          mkdir -p "$MNT" "$ISO_DIR"
+          sudo mount -o loop,ro "$ISO_FILE" "$MNT"
+          sudo cp -a "$MNT/." "$ISO_DIR/"
+          sudo umount "$MNT"
+          sudo chown -R "$(id -u):$(id -g)" "$ISO_DIR"
+          sudo chmod -R u+rwX "$ISO_DIR"
+
+      # --- the first-stage installer lives inside install.img; overlay the
+      #     staged installer files (mostly /opt/xensource/installer/) so the
+      #     installation runs the modified code from the test_ai_code branch ---
+      - name: Patch installer inside install.img
+        run: |
+          set -euo pipefail
+          IMG="$ISO_DIR/install.img"
+          if [ ! -f "$IMG" ]; then
+            echo "::error::install.img not found on the ISO"
+            exit 1
+          fi
+
+          # installer files staged from the test_ai_code branch
+          PAYLOAD="$WS/stage"
+          echo "Installer files to overlay:"
+          find "$PAYLOAD" -maxdepth 4 -type d | sed -n '1,20p'
+
+          FSTYPE="$(file -b "$IMG")"
+          echo "install.img: $FSTYPE"
+
+          # the image may be gzip/xz wrapped depending on XCP-ng version
+          COMP=""
+          if echo "$FSTYPE" | grep -qi 'gzip compressed'; then COMP=gzip
+          elif echo "$FSTYPE" | grep -qi 'XZ compressed'; then COMP=xz
+          elif echo "$FSTYPE" | grep -qi 'bzip2 compressed'; then COMP=bz2
+          fi
+          if [ -n "$COMP" ]; then
+            case "$COMP" in
+              gzip) gunzip -c "$IMG" > "$IMG.unpacked" ;;
+              xz)   unxz  -c "$IMG" > "$IMG.unpacked" ;;
+              bz2)  bunzip2 -c "$IMG" > "$IMG.unpacked" ;;
+            esac
+            mv "$IMG.unpacked" "$IMG"
+            FSTYPE="$(file -b "$IMG")"
+            echo "install.img (uncompressed): $FSTYPE"
+          fi
+
+          case "$FSTYPE" in
+            *Squashfs*|*squashfs*)
+              echo "install.img is a squashfs image"
+              ROOT="$WS/install-root"
+              unsquashfs -d "$ROOT" "$IMG" > /dev/null
+              rsync -a "$PAYLOAD/" "$ROOT/"
+              mksquashfs "$ROOT" "$IMG.new" -noappend -all-root -comp xz -b 1M > /dev/null
+              mv "$IMG.new" "$IMG"
+              ;;
+            *ext2*|*ext3*|*ext4*|*Linux\ rev*)
+              echo "install.img is an ext2/3/4 filesystem image"
+              truncate -s +64M "$IMG"            # make room for the new files
+              sudo e2fsck -fp "$IMG" || true
+              sudo resize2fs -f "$IMG"
+              MNT="$WS/install-mnt"
+              mkdir -p "$MNT"
+              sudo mount -o loop "$IMG" "$MNT"
+              sudo rsync -a --chown=root:root "$PAYLOAD/" "$MNT/"
+              sudo umount "$MNT"
+              ;;
+            *cpio*)
+              echo "install.img is a cpio (newc) archive"
+              ROOT="$WS/install-root"
+              mkdir -p "$ROOT"
+              # extract as root: files are recreated with their original
+              # modes/ownership (shadow=000, setuid binaries, ...)
+              ( cd "$ROOT" && sudo cpio -idm --quiet < "$IMG" )
+              # overlay the staged installer files as root
+              sudo rsync -a --chown=root:root "$PAYLOAD/" "$ROOT/"
+              # repack as root: reads everything, records root ownership
+              ( cd "$ROOT" && sudo sh -c \
+                  'find . -print0 | cpio --null -o -H newc --quiet' ) > "$IMG.new"
+              mv "$IMG.new" "$IMG"
+              ;;
+            *)
+              echo "::error::Unrecognized install.img format: $FSTYPE"
+              exit 1
+              ;;
+          esac
+
+          if [ -n "$COMP" ]; then
+            case "$COMP" in
+              gzip) gzip -9 "$IMG" ;;
+              xz)   xz -9 -T0 "$IMG" ;;
+              bz2)  bzip2 -9 "$IMG" ;;
+            esac
+            mv "$IMG.gz" "$IMG" 2>/dev/null || mv "$IMG.xz" "$IMG" || mv "$IMG.bz2" "$IMG"
+          fi
+          echo "install.img updated:"
+          ls -lh "$IMG"
+
+      # --- docs step: rebuild the ISO ---
+      - name: Rebuild the ISO
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT_DIR"
+          sudo chown -R root:root "$ISO_DIR"
+          cd "$ISO_DIR"
+
+          LABEL="$(isoinfo -d -i "$ISO_FILE" | awk -F'Volume id: ' '/Volume id:/{print $2}')"
+          LABEL="${LABEL:-XCP-ng}"
+          ISOLINUX_BIN="$(find . -name isolinux.bin -print -quit | sed 's#^\./##')"
+          EFIBOOT="$(find . -type f -iname 'efiboot*.img' -print -quit | sed 's#^\./##')"
+          if [ -z "$ISOLINUX_BIN" ] || [ -z "$EFIBOOT" ]; then
+            echo "::error::isolinux.bin and/or efiboot.img not found in the extracted ISO"
+            exit 1
+          fi
+          BOOTCAT="$(dirname "$ISOLINUX_BIN")/boot.cat"
+          MBR_BIN=/usr/lib/ISOLINUX/isohdpfx.bin
+          [ -f "$MBR_BIN" ] || MBR_BIN=/usr/lib/syslinux/modules/bios/isohdpfx.bin
+          echo "label='$LABEL' isolinux='$ISOLINUX_BIN' efiboot='$EFIBOOT'"
+
+          # Same options as the documented genisoimage command, run through
+          # xorriso -as mkisofs so the result can also be dd'ed to USB sticks:
+          #   -isohybrid-mbr        -> BIOS USB boot
+          #   -isohybrid-gpt-basdat -> UEFI USB boot
+          xorriso -as mkisofs \
+            -J -R -V "$LABEL" \
+            -isohybrid-mbr "$MBR_BIN" \
+            -b "$ISOLINUX_BIN" \
+            -c "$BOOTCAT" \
+            -no-emul-boot -boot-load-size 4 -boot-info-table \
+            -eltorito-alt-boot -e "$EFIBOOT" -no-emul-boot \
+            -isohybrid-gpt-basdat \
+            -o "$OUT_ISO" \
+            .
+          ls -lh "$OUT_ISO"
+
+      # --- docs step: implant the MD5 checksum (enables the "mediacheck" boot entry) ---
+      - name: Implant MD5 checksum
+        run: |
+          set -euo pipefail
+          implantisomd5 --force "$OUT_ISO"
+
+      - name: Verify modified ISO
+        run: |
+          set -euo pipefail
+          isoinfo -d -i "$OUT_ISO" | sed -n '1,15p'
+          checkisomd5 "$OUT_ISO"
+
+      - name: Upload modified ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcp-ng-${{ matrix.version }}-modified-iso
+          path: ${{ env.OUT_ISO }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Job summary
+        run: |
+          {
+            echo "### XCP-ng ${{ matrix.version }} — modified ISO"
+            echo "- Installer source: \`${{ env.INSTALLER_REPO }}\` branch \`${{ env.INSTALLER_BRANCH }}\`"
+            echo "- Base ISO: \`${{ matrix.iso_url }}\`"
+            echo "- Artifact: \`xcp-ng-${{ matrix.version }}-modified-iso\`"
+          } >> "$GITHUB_STEP_SUMMARY"
