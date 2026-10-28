@@ -208,6 +208,273 @@ def overwrite_warning(answers):
     if button == 'back': return LEFT_BACKWARDS
     return RIGHT_FORWARDS
 
+def override_installation_detection(answers):
+    installed = answers.get('installed-products', [])
+    upgradeable = answers.get('upgradeable-products', [])
+    backups = answers.get('backups', [])
+
+    if not installed and not backups:
+        return SKIP_SCREEN
+
+    lines = []
+    if installed:
+        lines.append("Existing installations found:")
+        for x in installed:
+            status = "upgradeable" if x in upgradeable else "not upgradeable"
+            lines.append("  * %s on %s (%s)" % (
+                x, diskutil.getHumanDiskLabel(x.primary_disk, short=True), status))
+    if backups:
+        if lines:
+            lines.append("")
+        lines.append("Backups found:")
+        for b in backups:
+            lines.append("  * %s on %s" % (
+                b, diskutil.getHumanDiskLabel(b.root_disk, short=True)))
+
+    lines.append("")
+    lines.append("You can accept these results or override them to perform a clean installation or select a different disk to overwrite.")
+    detection_summary = "\n".join(lines)
+
+    button = snackutil.ButtonChoiceWindowEx(
+        tui.screen,
+        "Existing Installations Detected",
+        detection_summary,
+        ['Accept', 'Override', 'Back'],
+        width=60, default=0, help='overrideinst')
+
+    if button == 'back':
+        return LEFT_BACKWARDS
+
+    if button == 'override':
+        return _handle_override(answers)
+
+    return RIGHT_FORWARDS
+
+def _handle_override(answers):
+    entries = [
+        ("Force clean installation", 'clean'),
+        ("Select a disk to overwrite", 'overwrite'),
+        ("Manually specify partition devices", 'manual'),
+    ]
+
+    text = "How would you like to override the detection results?"
+
+    (button, entry) = snackutil.ListboxChoiceWindowEx(
+        tui.screen,
+        "Override Detection",
+        text,
+        entries,
+        ['Ok', 'Back'], width=60, default=0, help='overrideinst')
+
+    if button == 'back':
+        return RIGHT_FORWARDS
+
+    if entry == 'clean':
+        answers['installed-products'] = []
+        answers['upgradeable-products'] = []
+        answers['backups'] = []
+        answers['detection-overridden'] = True
+        answers['install-type'] = constants.INSTALL_TYPE_FRESH
+        answers['preserve-settings'] = False
+        if 'installation-to-overwrite' in answers:
+            del answers['installation-to-overwrite']
+        return RIGHT_FORWARDS
+
+    if entry == 'overwrite':
+        return _override_select_disk(answers)
+
+    if entry == 'manual':
+        return _override_manual_partitions(answers)
+
+    return RIGHT_FORWARDS
+
+def _override_select_disk(answers):
+    diskEntries = sorted_disk_list()
+
+    entries = []
+    min_size = constants.min_primary_disk_size
+
+    for de in diskEntries:
+        (vendor, model, size) = diskutil.getExtendedDiskInfo(de)
+        if diskutil.blockSizeToGBSize(size) < min_size:
+            continue
+        e = (diskutil.getHumanDiskLabel(de), de)
+        entries.append(e)
+
+    if len(entries) == 0:
+        ButtonChoiceWindow(tui.screen,
+                           "No Disks Available",
+                           "No disk with sufficient space was found.",
+                           ['Back'])
+        return RIGHT_FORWARDS
+
+    tui.update_help_line([None, "<F5> more info"])
+
+    scroll, height = snackutil.scrollHeight(4, len(entries))
+    (button, entry) = snackutil.ListboxChoiceWindowEx(
+        tui.screen,
+        "Select Disk to Overwrite",
+        "Please select the disk to overwrite. If it contains an existing installation, it will be set as the upgrade target.",
+        entries,
+        ['Ok', 'Back'],
+        55, scroll, height, help='overwrt:info',
+        hotkeys={'F5': disk_more_info})
+
+    tui.screen.popHelpLine()
+
+    if button == 'back':
+        return RIGHT_FORWARDS
+
+    if entry is None:
+        return RIGHT_FORWARDS
+
+    tui.progress.showMessageDialog("Please wait", "Checking disk for existing installations...")
+    try:
+        disk = diskutil.probeDisk(entry, raid_members=diskutil.RAID_MEMBERS_DONT_PROBE)
+        if disk.root[0] == diskutil.INSTALL_RETAIL:
+            inst = product.ExistingRetailInstallation(
+                entry, disk.boot[1], disk.root[1], disk.state[1], disk.storage)
+            answers['installed-products'] = [inst]
+            answers['upgradeable-products'] = [inst]
+            answers['backups'] = []
+            answers['installation-to-overwrite'] = inst
+            answers['install-type'] = constants.INSTALL_TYPE_REINSTALL
+            answers['primary-disk'] = inst.primary_disk
+            if diskutil.is_raid(entry):
+                answers['physical-disks'] = diskutil.getSWRAIDDevices(entry)
+            else:
+                answers['physical-disks'] = [answers['primary-disk']]
+            answers['preserve-settings'] = inst.settingsAvailable()
+            answers['detection-overridden'] = True
+            tui.progress.clearModelessDialog()
+        else:
+            tui.progress.clearModelessDialog()
+            answers['installed-products'] = []
+            answers['upgradeable-products'] = []
+            answers['backups'] = []
+            answers['detection-overridden'] = True
+            answers['install-type'] = constants.INSTALL_TYPE_FRESH
+            answers['preserve-settings'] = False
+            answers['primary-disk'] = entry
+            if diskutil.is_raid(entry):
+                answers['physical-disks'] = diskutil.getSWRAIDDevices(entry)
+            else:
+                answers['physical-disks'] = [entry]
+            if 'installation-to-overwrite' in answers:
+                del answers['installation-to-overwrite']
+    except Exception as e:
+        tui.progress.clearModelessDialog()
+        logger.log("Error probing disk: %s" % str(e))
+        ButtonChoiceWindow(tui.screen,
+                           "Error",
+                           "An error occurred while checking the disk: %s" % str(e),
+                           ['Back'])
+        return RIGHT_FORWARDS
+
+    return RIGHT_FORWARDS
+
+def _override_manual_partitions(answers):
+    available_partitions = diskutil.getQualifiedPartitionList()
+
+    text = "Specify the partition devices for the existing installation.\nLeave fields blank where the device is not applicable."
+
+    root_entry = Entry(40)
+    state_entry = Entry(40)
+    boot_entry = Entry(40)
+    logs_entry = Entry(40)
+    storage_entry = Entry(40)
+
+    buttons = ButtonBar(tui.screen, [('Ok', 'ok'), ('Back', 'back')])
+
+    gf = GridFormHelp(tui.screen, "Manual Partition Specification", "manualpart", 1, 12)
+
+    gf.add(TextboxReflowed(54, text), 0, 0, padding=(0, 0, 0, 1))
+
+    gf.add(Textbox(20, 1, "Root device:"), 0, 1)
+    gf.add(root_entry, 0, 2, padding=(0, 0, 0, 1))
+
+    gf.add(Textbox(20, 1, "State device:"), 0, 3)
+    gf.add(state_entry, 0, 4, padding=(0, 0, 0, 1))
+
+    gf.add(Textbox(20, 1, "Boot device:"), 0, 5)
+    gf.add(boot_entry, 0, 6, padding=(0, 0, 0, 1))
+
+    gf.add(Textbox(20, 1, "Logs device:"), 0, 7)
+    gf.add(logs_entry, 0, 8, padding=(0, 0, 0, 1))
+
+    gf.add(Textbox(20, 1, "Storage device:"), 0, 9)
+    gf.add(storage_entry, 0, 10, padding=(0, 0, 0, 1))
+
+    gf.add(buttons, 0, 11, growx=1)
+
+    rc = gf.run()
+
+    if buttons.buttonPressed(rc) == 'back':
+        return RIGHT_FORWARDS
+
+    root_dev = root_entry.value().strip()
+    state_dev = state_entry.value().strip() or root_dev
+    boot_dev = boot_entry.value().strip() or None
+    logs_dev = logs_entry.value().strip() or None
+    storage_dev = storage_entry.value().strip() or None
+
+    if not root_dev:
+        ButtonChoiceWindow(tui.screen, "Error", "Root device is required.", ['Back'])
+        return RIGHT_FORWARDS
+
+    tui.progress.showMessageDialog("Please wait", "Probing specified partitions...")
+    try:
+        storage = None
+        if storage_dev:
+            storage = (diskutil.STORAGE_LVM, storage_dev)
+
+        inst = product.ExistingRetailInstallation(
+            root_dev.split('p')[0] if 'p' in root_dev else root_dev.replace('/dev/', '/dev/'),
+            boot_dev, root_dev, state_dev, storage)
+
+        answers['installed-products'] = [inst]
+        answers['upgradeable-products'] = [inst]
+        answers['backups'] = []
+        answers['installation-to-overwrite'] = inst
+        answers['install-type'] = constants.INSTALL_TYPE_REINSTALL
+        answers['primary-disk'] = inst.primary_disk
+        answers['preserve-settings'] = inst.settingsAvailable()
+        answers['detection-overridden'] = True
+
+        if logs_dev:
+            answers['logs-device'] = logs_dev
+
+        tui.progress.clearModelessDialog()
+    except Exception as e:
+        tui.progress.clearModelessDialog()
+        logger.log("Error creating installation from manual partitions: %s" % str(e))
+        ButtonChoiceWindow(tui.screen, "Error",
+                           "Failed to create installation from specified partitions: %s" % str(e),
+                           ['Back'])
+        return RIGHT_FORWARDS
+
+    return RIGHT_FORWARDS
+
+def bios_warning(answers):
+    text = ("Booting %s hosts in BIOS mode is now deprecated. "
+            "You can still install your %s hosts in BIOS boot mode. "
+            "However, doing so may prevent you from upgrading your %s "
+            "hosts to a future version of %s. We recommend that you "
+            "install your %s hosts by using UEFI boot mode.") % ((MY_PRODUCT_BRAND,) * 5)
+
+    button = ButtonChoiceWindow(
+        tui.screen,
+        "System Firmware",
+        text,
+        ['Ok', 'Back'],
+        width=60, help="bioswarn"
+    )
+
+    if button == 'back':
+        return LEFT_BACKWARDS
+
+    return RIGHT_FORWARDS
+
 def get_admin_interface(answers):
     default = None
     try:
