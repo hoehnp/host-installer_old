@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 env:
-  INSTALLER_REPO: hoehnp/host-installer
-  INSTALLER_BRANCH: test_ai_code
+  INSTALLER_REPO: hoehnp/host-installer_old
+  INSTALLER_BRANCH: 7.6
 
 jobs:
   modified-iso:
