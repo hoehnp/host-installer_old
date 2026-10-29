@@ -370,6 +370,12 @@ def getHumanDiskSize(blocks):
     else:
         return "%d MB" % blockSizeToMBSize(blocks)
 
+def getHumanDiskLabel(disk, short=False):
+    (vendor, model, size) = getExtendedDiskInfo(disk)
+    template = "{device} - {size} [{vendor} {model}]" if not short else "{device} - {size}"
+    return template.format(device=getHumanDiskName(disk), size=getHumanDiskSize(size),
+                           vendor=vendor, model=model)
+
 def getExtendedDiskInfo(disk, inMb = 0):
     return (getDiskDeviceVendor(disk), getDiskDeviceModel(disk),
             inMb and (getDiskDeviceSize(disk)/2048) or getDiskDeviceSize(disk))
