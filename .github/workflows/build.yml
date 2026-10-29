@@ -11,7 +11,7 @@ permissions:
 
 env:
   INSTALLER_REPO: hoehnp/host-installer_old
-  INSTALLER_BRANCH: 8.0
+  INSTALLER_BRANCH: "8.0"
 
 jobs:
   modified-iso:
